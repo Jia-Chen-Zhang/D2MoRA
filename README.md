@@ -1,1 +1,1 @@
-# $D^2$MoRA
+# D<sup>2</sup>MoRA
