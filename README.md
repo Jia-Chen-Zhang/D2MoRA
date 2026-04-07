@@ -1,6 +1,6 @@
-# `<D<sup>2</sup>MoRA: Diversity-Regulated Asymmetric MoE-LoRA Decomposition for Efficient Multi-Task Adaptation>`
+# <D<sup>2</sup>MoRA: Diversity-Regulated Asymmetric MoE-LoRA Decomposition for Efficient Multi-Task Adaptation>
 
-> `<D<sup>2</sup>MoRA is a diversity-regulated asymmetric MoE-LoRA framework for multi-task adaptation that improves parameter efficiency and expert specialization by decoupling low-rank decomposition and explicitly encouraging diversity across experts.>`
+> <D<sup>2</sup>MoRA is a diversity-regulated asymmetric MoE-LoRA framework for multi-task adaptation that improves parameter efficiency and expert specialization by decoupling low-rank decomposition and explicitly encouraging diversity across experts.>
 
 ## Authors
 
