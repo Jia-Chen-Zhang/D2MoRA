@@ -82,8 +82,11 @@ class D2MoRAConfig(PeftConfig):
             "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
         },
     )
-    expert_down: int = field(default=2, metadata={"help": "Expert number for down"})
-    expert_up: int = field(default=4, metadata={"help": "Expert number for up"})
+    # Global MoE parameters for decoupled factorization
+    num_experts_A: int = field(default=8, metadata={"help": "Number of global A matrices (down-projection experts)"})
+    num_experts_B: int = field(default=8, metadata={"help": "Number of global B matrices (up-projection experts)"})
+    top_k_A: int = field(default=2, metadata={"help": "Number of top A experts to use per forward pass"})
+    top_k_B: int = field(default=2, metadata={"help": "Number of top B experts to use per forward pass"})
 
     def __post_init__(self):
         self.peft_type = PeftType.D2MORA
@@ -166,7 +169,10 @@ class D2MoRAModel(torch.nn.Module):
                         new_module = MergedLinear8bitLt(target.in_features, target.out_features, bias=bias, **kwargs)
                 elif isinstance(target, torch.nn.Linear) and self.peft_config.enable_lora is None:
                     new_module = D2MoRALinear(target.in_features, target.out_features, bias=bias,
-                                           expert_down=self.peft_config.expert_down, expert_up=self.peft_config.expert_up, **kwargs)
+                                           num_experts_A=self.peft_config.num_experts_A, 
+                                           num_experts_B=self.peft_config.num_experts_B,
+                                           top_k_A=self.peft_config.top_k_A,
+                                           top_k_B=self.peft_config.top_k_B, **kwargs)
                 elif self.peft_config.enable_lora is not None:
                     kwargs.update({"enable_lora": self.peft_config.enable_lora})
                     if isinstance(target, Conv1D):
@@ -289,7 +295,7 @@ class D2MoRALayer:
 
 
 class D2MoRALinear(nn.Linear, D2MoRALayer):
-    # Lora implemented in a dense layer
+    # Lora implemented in a dense layer with global decoupled MoE factorization
     def __init__(
         self,
         in_features: int,
@@ -299,29 +305,34 @@ class D2MoRALinear(nn.Linear, D2MoRALayer):
         lora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         merge_weights: bool = True,
-        expert_down: int = 2,
-        expert_up: int = 4,
+        num_experts_A: int = 8,  # Global number of A matrices
+        num_experts_B: int = 8,  # Global number of B matrices
+        top_k_A: int = 2,        # Top-k experts for A routing
+        top_k_B: int = 2,        # Top-k experts for B routing
         **kwargs,
     ):
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         D2MoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
 
         self.fan_in_fan_out = fan_in_fan_out
-        self.expert_down = expert_down
-        self.expert_up = expert_up
+        self.num_experts_A = num_experts_A
+        self.num_experts_B = num_experts_B
+        self.top_k_A = top_k_A
+        self.top_k_B = top_k_B
         self.r = r
         # Actual trainable parameters
         if r > 0:
-            # self.lora_A = nn.Linear(in_features, r, bias=False)
-            # self.lora_B = nn.Linear(r, out_features, bias=False)
+            # Global expert pools - shared across all layers
+            # A experts: down-projection from in_features to r
+            self.lora_A = nn.ModuleList([nn.Linear(in_features, r, bias=False) for _ in range(num_experts_A)])
+            # B experts: up-projection from r to out_features  
+            self.lora_B = nn.ModuleList([nn.Linear(r, out_features, bias=False) for _ in range(num_experts_B)])
             
-            self.lora_route1 = nn.Linear(in_features, self.expert_down, bias=False)
-            self.lora_route2 = nn.Linear(self.r, self.expert_up, bias=False)
-            self.lora_A, self.lora_B = nn.ModuleList(), nn.ModuleList()
-            for i in range(self.expert_down):
-                self.lora_A.append(nn.Linear(in_features, r, bias=False))
-            for i in range(self.expert_up):
-                self.lora_B.append(nn.Linear(r, out_features, bias=False))
+            # Router networks for selecting experts
+            # Router A: selects top-k A experts based on input
+            self.lora_router_A = nn.Linear(in_features, num_experts_A, bias=False)
+            # Router B: selects top-k B experts based on intermediate representation
+            self.lora_router_B = nn.Linear(r, num_experts_B, bias=False)
 
             self.scaling = self.lora_alpha / self.r
             # Freezing the pre-trained weight matrix
@@ -334,54 +345,52 @@ class D2MoRALinear(nn.Linear, D2MoRALayer):
         nn.Linear.reset_parameters(self)
         if hasattr(self, "lora_A"):
             # initialize A the same way as the default for nn.Linear and B to zero
-            # nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-            # nn.init.zeros_(self.lora_B.weight)
-            for i in range(self.expert_down):
+            for i in range(self.num_experts_A):
                 nn.init.kaiming_uniform_(self.lora_A[i].weight, a=math.sqrt(5))
-            for i in range(self.expert_up):
+            for i in range(self.num_experts_B):
                 nn.init.zeros_(self.lora_B[i].weight)
 
-            nn.init.kaiming_uniform_(self.lora_route1.weight, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(self.lora_route2.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.lora_router_A.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.lora_router_B.weight, a=math.sqrt(5))
 
     def train(self, mode: bool = True):
         nn.Linear.train(self, mode)
-        self.lora_route1.train(mode)
-        self.lora_route2.train(mode)
-        for i in range(self.expert_down):
+        self.lora_router_A.train(mode)
+        self.lora_router_B.train(mode)
+        for i in range(self.num_experts_A):
             self.lora_A[i].train(mode)
-        for i in range(self.expert_up):
+        for i in range(self.num_experts_B):
             self.lora_B[i].train(mode)
 
         if not mode and self.merge_weights and not self.merged:
             # Merge the weights and mark it
             if self.r > 0:
                 self.weight.data += (
-                    transpose(self.lora_B.weight @ self.lora_A.weight, self.fan_in_fan_out) * self.scaling
+                    transpose(self.lora_B[0].weight @ self.lora_A[0].weight, self.fan_in_fan_out) * self.scaling
                 )
             self.merged = True
         elif self.merge_weights and self.merged:
             # Make sure that the weights are not merged
             if self.r > 0:
                 self.weight.data -= (
-                    transpose(self.lora_B.weight @ self.lora_A.weight, self.fan_in_fan_out) * self.scaling
+                    transpose(self.lora_B[0].weight @ self.lora_A[0].weight, self.fan_in_fan_out) * self.scaling
                 )
             self.merged = False
 
     def eval(self):
         nn.Linear.eval(self)
-        self.lora_route1.eval()
-        self.lora_route2.eval()
-        for i in range(self.expert_down):
+        self.lora_router_A.eval()
+        self.lora_router_B.eval()
+        for i in range(self.num_experts_A):
             self.lora_A[i].eval()
-        for i in range(self.expert_up):
+        for i in range(self.num_experts_B):
             self.lora_B[i].eval()
 
     def forward(self, x: torch.Tensor, **kwargs):
         previous_dtype = self.weight.dtype
         if self.disable_adapters:
             if self.r > 0 and self.merged:
-                matmul_output = self.lora_B.weight @ self.lora_A.weight
+                matmul_output = self.lora_B[0].weight @ self.lora_A[0].weight
                 self.weight.data -= transpose(matmul_output.to(previous_dtype), self.fan_in_fan_out) * self.scaling
                 self.merged = False
 
@@ -389,22 +398,39 @@ class D2MoRALinear(nn.Linear, D2MoRALayer):
         elif self.r > 0 and not self.merged:
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
             if self.r > 0:
-
-                route_weight1 = nn.functional.softmax(self.lora_route1(x.to(torch.float32)), dim=-1)
-                mid_result = torch.zeros(x.shape[0], x.shape[1], self.r).to(x.device)
-                for i in range(self.expert_down):
-                    mid_result += (self.lora_dropout(x.to(self.lora_A[i].weight.dtype)) @ self.lora_A[i].weight.T
-                                   * torch.unsqueeze(route_weight1[..., i], -1))
-                route_weight2 = nn.functional.softmax(self.lora_route2(mid_result.to(torch.float32)), dim=-1)
-                for i in range(self.expert_up):
-                    result = (result + mid_result @ self.lora_B[i].weight.T * torch.unsqueeze(route_weight2[:,:,i], -1)
-                              * self.scaling)
-
-                # route_weights = nn.functional.softmax(self.lora_route1(x.to(torch.float32)), dim=-1)
-                # route_weights = nn.functional.softmax(self.lora_route(x.to(torch.float32)), dim=-1)
-                # for i in range(self.expert_up):
-                #     result = result + ((self.lora_dropout(x.to(self.lora_A[i].weight.dtype)) @ self.lora_A[i].weight.T)
-                #                        @ self.lora_B[i].weight.T) * torch.unsqueeze(route_weights[:,:,i], -1) * self.scaling
+                # Router A: compute gating scores for A experts
+                router_logits_A = self.lora_router_A(x.to(torch.float32))
+                # Top-k selection for A experts
+                topk_scores_A, topk_indices_A = torch.topk(router_logits_A, self.top_k_A, dim=-1)
+                topk_weights_A = nn.functional.softmax(topk_scores_A, dim=-1)
+                
+                # Compute weighted combination of A expert outputs
+                mid_result = torch.zeros(x.shape[0], x.shape[1], self.r, dtype=x.dtype, device=x.device)
+                for k in range(self.top_k_A):
+                    expert_idx = topk_indices_A[..., k]
+                    weight = topk_weights_A[..., k].unsqueeze(-1)
+                    # Gather expert output using advanced indexing
+                    for b in range(x.shape[0]):
+                        for t in range(x.shape[1]):
+                            idx = expert_idx[b, t].item()
+                            mid_result[b, t] += (self.lora_dropout(x[b, t].to(self.lora_A[idx].weight.dtype)) 
+                                                  @ self.lora_A[idx].weight.T * weight[b, t])
+                
+                # Router B: compute gating scores for B experts based on intermediate representation
+                router_logits_B = self.lora_router_B(mid_result.to(torch.float32))
+                # Top-k selection for B experts
+                topk_scores_B, topk_indices_B = torch.topk(router_logits_B, self.top_k_B, dim=-1)
+                topk_weights_B = nn.functional.softmax(topk_scores_B, dim=-1)
+                
+                # Compute weighted combination of B expert outputs
+                for k in range(self.top_k_B):
+                    expert_idx = topk_indices_B[..., k]
+                    weight = topk_weights_B[..., k].unsqueeze(-1)
+                    for b in range(x.shape[0]):
+                        for t in range(x.shape[1]):
+                            idx = expert_idx[b, t].item()
+                            result = result + (mid_result[b, t] @ self.lora_B[idx].weight.T 
+                                               * weight[b, t] * self.scaling)
 
 
         else:
