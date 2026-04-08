@@ -17,8 +17,9 @@ Global D2MoRA (GD2MoRA): Global Many-to-Many Decomposed Low-Rank Adapter
 
 This module implements a global version of D2MoRA where:
 1. A global pool of factorized matrices (A and B) is shared across all layers
-2. Each layer routes its input to selected experts from the global pool
-3. This reduces total parameters while improving expert utilization
+2. Each layer has its own router (layer-specific routing)
+3. Efficient vectorized operations (no Python-level loops over batch/seq)
+4. Global load balancing loss across all layers
 """
 
 import importlib
@@ -27,7 +28,7 @@ import re
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import List, Optional, Union, Dict, Any
+from typing import List, Optional, Union, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -60,8 +61,9 @@ class GD2MoRAConfig(PeftConfig):
         num_experts_b (`int`): Number of global B matrices (up-projection experts)
         top_k_a (`int`): Number of A experts to select per forward pass
         top_k_b (`int`): Number of B experts to select per forward pass
-        share_router (`bool`): Whether to share router across layers
         load_balancing_loss_weight (`float`): Weight for the load balancing loss
+        bias (`str`): Bias type for GD2MoRA. Can be 'none', 'all' or 'lora_only'
+        modules_to_save (`List[str]`): List of modules apart from GD2MoRA layers to be set as trainable
     """
 
     r: int = field(default=8, metadata={"help": "Low-rank dimension"})
@@ -82,7 +84,6 @@ class GD2MoRAConfig(PeftConfig):
     num_experts_b: int = field(default=4, metadata={"help": "Number of global B matrix experts"})
     top_k_a: int = field(default=2, metadata={"help": "Number of A experts to use per forward pass"})
     top_k_b: int = field(default=2, metadata={"help": "Number of B experts to use per forward pass"})
-    share_router: bool = field(default=False, metadata={"help": "Share router across all layers"})
     load_balancing_loss_weight: float = field(default=0.01, metadata={"help": "Weight for load balancing loss"})
     bias: str = field(default="none", metadata={"help": "Bias type for GD2MoRA. Can be 'none', 'all' or 'lora_only'"})
     modules_to_save: Optional[List[str]] = field(
@@ -101,9 +102,10 @@ class GlobalExpertPool(nn.Module):
     Global pool of factorized experts shared across all layers.
     
     This maintains:
-    - A pool of A matrices (input -> hidden)
-    - A pool of B matrices (hidden -> output)
-    - Optional: shared routers or per-layer routers
+    - A pool of A matrices (input -> hidden) - SHARED globally
+    - A pool of B matrices (hidden -> output) - SHARED globally
+    
+    Routers are NOT stored here - each layer has its own router.
     """
     
     def __init__(self, config: GD2MoRAConfig, in_features: int, out_features: int):
@@ -114,27 +116,18 @@ class GlobalExpertPool(nn.Module):
         self.r = config.r
         self.num_experts_a = config.num_experts_a
         self.num_experts_b = config.num_experts_b
-        self.top_k_a = min(config.top_k_a, self.num_experts_a)
-        self.top_k_b = min(config.top_k_b, self.num_experts_b)
         
-        # Global expert pools
+        # Global expert pools - SHARED across all layers
+        # A experts: map from input features to rank-r space
         self.experts_a = nn.ModuleList([
             nn.Linear(in_features, self.r, bias=False) 
             for _ in range(self.num_experts_a)
         ])
+        # B experts: map from rank-r space to output features
         self.experts_b = nn.ModuleList([
             nn.Linear(self.r, out_features, bias=False) 
             for _ in range(self.num_experts_b)
         ])
-        
-        # Router networks (can be shared or per-instance)
-        if not config.share_router:
-            self.router_a = nn.Linear(in_features, self.num_experts_a, bias=False)
-            self.router_b = nn.Linear(self.r, self.num_experts_b, bias=False)
-        else:
-            # For shared routers, these will be set externally
-            self.router_a = None
-            self.router_b = None
         
         self.scaling = config.lora_alpha / self.r if config.lora_alpha else 1.0
         
@@ -146,94 +139,71 @@ class GlobalExpertPool(nn.Module):
             nn.init.kaiming_uniform_(expert_a.weight, a=math.sqrt(5))
         for expert_b in self.experts_b:
             nn.init.zeros_(expert_b.weight)
-        
-        if self.router_a is not None:
-            nn.init.kaiming_uniform_(self.router_a.weight, a=math.sqrt(5))
-        if self.router_b is not None:
-            nn.init.kaiming_uniform_(self.router_b.weight, a=math.sqrt(5))
     
-    def set_shared_routers(self, router_a: nn.Module, router_b: nn.Module):
-        """Use shared routers instead of per-layer routers"""
-        self.router_a = router_a
-        self.router_b = router_b
-    
-    def forward(self, x: torch.Tensor, return_aux_loss: bool = False):
+    def forward(self, x: torch.Tensor, router_logits_a: torch.Tensor, router_logits_b: torch.Tensor):
         """
-        Forward pass through global expert pool.
+        Forward pass through global expert pool using layer-specific router logits.
         
         Args:
             x: Input tensor of shape (batch_size, seq_len, in_features)
-            return_aux_loss: Whether to return auxiliary losses for load balancing
-            
+            router_logits_a: Router logits for A experts from layer-specific router
+                           Shape: (batch_size * seq_len, num_experts_a)
+            router_logits_b: Router logits for B experts from layer-specific router
+                           Shape: (batch_size * seq_len, num_experts_b)
+                           
         Returns:
             output: Output tensor of shape (batch_size, seq_len, out_features)
-            aux_loss: Auxiliary loss for load balancing (if return_aux_loss=True)
+            aux_loss_a: Auxiliary loss for A expert load balancing
+            aux_loss_b: Auxiliary loss for B expert load balancing
         """
         batch_size, seq_len, _ = x.shape
-        
-        # Compute router logits for A experts
-        if self.router_a is not None:
-            router_logits_a = self.router_a(x.float())  # (batch, seq, num_experts_a)
-        else:
-            router_logits_a = torch.zeros(batch_size, seq_len, self.num_experts_a, device=x.device)
+        flat_x = x.view(-1, self.in_features)  # (batch*seq, in_features)
         
         # Select top-k A experts
-        topk_logits_a, topk_indices_a = torch.topk(router_logits_a, self.top_k_a, dim=-1)  # (batch, seq, top_k)
-        weights_a = F.softmax(topk_logits_a, dim=-1)  # (batch, seq, top_k)
+        topk_logits_a, topk_indices_a = torch.topk(router_logits_a, self.config.top_k_a, dim=-1)
+        weights_a = F.softmax(topk_logits_a, dim=-1)  # (batch*seq, top_k_a)
         
-        # Compute outputs from selected A experts
-        # Shape: (batch, seq, top_k_a, r)
-        a_outputs = []
-        for k in range(self.top_k_a):
-            indices_k = topk_indices_a[..., k]  # (batch, seq)
-            # Gather the corresponding experts
-            expert_outputs = torch.stack([
-                self.experts_a[indices_k[b, s]](x[b, s]) 
-                for b in range(batch_size) for s in range(seq_len)
-            ], dim=0).view(batch_size, seq_len, self.r)
-            a_outputs.append(expert_outputs * weights_a[..., k:k+1])
+        # Compute outputs from ALL A experts efficiently
+        # Stack all expert outputs: (batch*seq, num_experts_a, r)
+        a_outputs_all = torch.stack([expert(flat_x) for expert in self.experts_a], dim=1)
         
-        # Combine A expert outputs
-        mid_result = sum(a_outputs)  # (batch, seq, r)
+        # Gather selected experts using advanced indexing
+        # Expand indices for gathering: (batch*seq, top_k_a, 1)
+        indices_expanded_a = topk_indices_a.unsqueeze(-1).expand(-1, -1, self.r)
+        # Gather: (batch*seq, top_k_a, r)
+        selected_a_outputs = torch.gather(a_outputs_all, 1, indices_expanded_a)
         
-        # Compute router logits for B experts
-        if self.router_b is not None:
-            router_logits_b = self.router_b(mid_result.float())  # (batch, seq, num_experts_b)
-        else:
-            router_logits_b = torch.zeros(batch_size, seq_len, self.num_experts_b, device=x.device)
+        # Weight and sum: (batch*seq, r)
+        mid_result = (selected_a_outputs * weights_a.unsqueeze(-1)).sum(dim=1)
+        
+        # Compute outputs from ALL B experts efficiently
+        # Stack all expert outputs: (batch*seq, num_experts_b, out_features)
+        b_outputs_all = torch.stack([expert(mid_result) for expert in self.experts_b], dim=1)
         
         # Select top-k B experts
-        topk_logits_b, topk_indices_b = torch.topk(router_logits_b, self.top_k_b, dim=-1)
-        weights_b = F.softmax(topk_logits_b, dim=-1)
+        topk_logits_b, topk_indices_b = torch.topk(router_logits_b, self.config.top_k_b, dim=-1)
+        weights_b = F.softmax(topk_logits_b, dim=-1)  # (batch*seq, top_k_b)
         
-        # Compute outputs from selected B experts
-        b_outputs = []
-        for k in range(self.top_k_b):
-            indices_k = topk_indices_b[..., k]
-            expert_outputs = torch.stack([
-                self.experts_b[indices_k[b, s]](mid_result[b, s])
-                for b in range(batch_size) for s in range(seq_len)
-            ], dim=0).view(batch_size, seq_len, self.out_features)
-            b_outputs.append(expert_outputs * weights_b[..., k:k+1])
+        # Gather selected experts: (batch*seq, top_k_b, out_features)
+        indices_expanded_b = topk_indices_b.unsqueeze(-1).expand(-1, -1, self.out_features)
+        selected_b_outputs = torch.gather(b_outputs_all, 1, indices_expanded_b)
         
-        # Combine B expert outputs and scale
-        output = sum(b_outputs) * self.scaling
+        # Weight and sum, then scale: (batch*seq, out_features)
+        output_flat = (selected_b_outputs * weights_b.unsqueeze(-1)).sum(dim=1) * self.scaling
+        
+        # Reshape back to (batch, seq, out_features)
+        output = output_flat.view(batch_size, seq_len, self.out_features)
         
         # Compute auxiliary losses for load balancing
-        aux_loss = 0.0
-        if return_aux_loss:
-            # Router probability distributions (averaged over batch and sequence)
-            router_probs_a = F.softmax(router_logits_a, dim=-1).mean(dim=[0, 1])  # (num_experts_a,)
-            router_probs_b = F.softmax(router_logits_b, dim=-1).mean(dim=[0, 1])  # (num_experts_b,)
-            
-            # Load balancing loss: encourage uniform routing
-            # Using coefficient of variation squared
-            aux_loss = (
-                self.num_experts_a * torch.var(router_probs_a) + 
-                self.num_experts_b * torch.var(router_probs_b)
-            )
+        # Router probability distributions (averaged over all tokens)
+        router_probs_a = F.softmax(router_logits_a, dim=-1).mean(dim=0)  # (num_experts_a,)
+        router_probs_b = F.softmax(router_logits_b, dim=-1).mean(dim=0)  # (num_experts_b,)
         
-        return output, aux_loss
+        # Load balancing loss: encourage uniform routing using coefficient of variation squared
+        aux_loss_a = self.num_experts_a * torch.var(router_probs_a)
+        aux_loss_b = self.num_experts_b * torch.var(router_probs_b)
+        
+        return output, aux_loss_a, aux_loss_b
 
 
 class GD2MoRALayer:
@@ -255,6 +225,52 @@ class GD2MoRALayer:
         self.merged = False
         self.merge_weights = merge_weights
         self.disable_adapters = False
+
+
+class LayerRouter(nn.Module):
+    """
+    Layer-specific router that produces routing logits for A and B experts.
+    
+    Each layer has its own router to make layer-specific routing decisions.
+    """
+    
+    def __init__(self, in_features: int, r: int, num_experts_a: int, num_experts_b: int):
+        super().__init__()
+        # Router A: maps input features to expert selection scores
+        self.router_a = nn.Linear(in_features, num_experts_a, bias=False)
+        # Router B: maps from rank-r space to expert selection scores
+        self.router_b = nn.Linear(r, num_experts_b, bias=False)
+        
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize router weights"""
+        nn.init.kaiming_uniform_(self.router_a.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.router_b.weight, a=math.sqrt(5))
+    
+    def forward(self, x: torch.Tensor, mid_result: Optional[torch.Tensor] = None):
+        """
+        Compute router logits for A and B experts.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, in_features) or (batch*seq, in_features)
+            mid_result: Intermediate result after A experts (batch*seq, r), optional
+            
+        Returns:
+            router_logits_a: Routing logits for A experts
+            router_logits_b: Routing logits for B experts
+        """
+        # Compute router logits for A experts
+        router_logits_a = self.router_a(x.float())
+        
+        # Compute router logits for B experts (requires mid_result)
+        if mid_result is not None:
+            router_logits_b = self.router_b(mid_result.float())
+        else:
+            # Return None for router_logits_b - will be computed later
+            router_logits_b = None
+        
+        return router_logits_a, router_logits_b
 
 
 class GD2MoRALinear(nn.Linear, GD2MoRALayer):
@@ -281,6 +297,14 @@ class GD2MoRALinear(nn.Linear, GD2MoRALayer):
         if r > 0:
             self.scaling = self.lora_alpha / self.r
             self.weight.requires_grad = False
+            
+            # Create layer-specific router
+            self.router = LayerRouter(
+                in_features=in_features,
+                r=r,
+                num_experts_a=global_pool.num_experts_a,
+                num_experts_b=global_pool.num_experts_b
+            )
         
         self.reset_parameters()
         if fan_in_fan_out:
@@ -288,26 +312,30 @@ class GD2MoRALinear(nn.Linear, GD2MoRALayer):
     
     def reset_parameters(self):
         nn.Linear.reset_parameters(self)
-        # Global pool has its own initialization
+        # Router and global pool have their own initialization
     
     def train(self, mode: bool = True):
         nn.Linear.train(self, mode)
+        if hasattr(self, 'router'):
+            self.router.train(mode)
         if self.global_pool is not None:
             self.global_pool.train(mode)
         
         if not mode and self.merge_weights and not self.merged:
-            # In eval mode with merge_weights, we would need to merge
-            # But for global MoE, merging is more complex, so we skip it
+            # Merging is complex for global MoE, skip it
             pass
         elif self.merge_weights and self.merged:
             self.merged = False
     
-    def forward(self, x: torch.Tensor, return_aux_loss: bool = False):
+    def forward(self, x: torch.Tensor):
         previous_dtype = self.weight.dtype
         
-        if self.disable_adapters:
+        if self.disable_adapters or not hasattr(self, 'router'):
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-            return result, torch.tensor(0.0, device=x.device) if return_aux_loss else result
+            # Store zero aux losses for consistency
+            self._last_aux_loss_a = torch.tensor(0.0, device=x.device)
+            self._last_aux_loss_b = torch.tensor(0.0, device=x.device)
+            return result
         
         # Base linear transformation
         result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
@@ -315,18 +343,56 @@ class GD2MoRALinear(nn.Linear, GD2MoRALayer):
         # Add GD2MoRA contribution
         if self.r > 0 and self.global_pool is not None:
             x_dropped = self.lora_dropout(x.to(next(self.global_pool.parameters()).dtype))
-            moe_output, aux_loss = self.global_pool(x_dropped, return_aux_loss=return_aux_loss)
+            batch_size, seq_len, _ = x_dropped.shape
+            flat_x = x_dropped.view(-1, self.in_features)
+            
+            # First, compute A expert outputs and get router logits for A
+            router_logits_a, _ = self.router(flat_x)
+            
+            # Select top-k A experts
+            topk_logits_a, topk_indices_a = torch.topk(router_logits_a, self.global_pool.config.top_k_a, dim=-1)
+            weights_a = F.softmax(topk_logits_a, dim=-1)
+            
+            # Compute outputs from ALL A experts efficiently
+            a_outputs_all = torch.stack([expert(flat_x) for expert in self.global_pool.experts_a], dim=1)
+            indices_expanded_a = topk_indices_a.unsqueeze(-1).expand(-1, -1, self.global_pool.r)
+            selected_a_outputs = torch.gather(a_outputs_all, 1, indices_expanded_a)
+            mid_result = (selected_a_outputs * weights_a.unsqueeze(-1)).sum(dim=1)
+            
+            # Now compute router logits for B using mid_result
+            _, router_logits_b = self.router(flat_x, mid_result)
+            
+            # Select top-k B experts
+            topk_logits_b, topk_indices_b = torch.topk(router_logits_b, self.global_pool.config.top_k_b, dim=-1)
+            weights_b = F.softmax(topk_logits_b, dim=-1)
+            
+            # Compute outputs from ALL B experts efficiently
+            b_outputs_all = torch.stack([expert(mid_result) for expert in self.global_pool.experts_b], dim=1)
+            indices_expanded_b = topk_indices_b.unsqueeze(-1).expand(-1, -1, self.out_features)
+            selected_b_outputs = torch.gather(b_outputs_all, 1, indices_expanded_b)
+            moe_output_flat = (selected_b_outputs * weights_b.unsqueeze(-1)).sum(dim=1) * self.scaling
+            
+            # Reshape back
+            moe_output = moe_output_flat.view(batch_size, seq_len, self.out_features)
             result = result + moe_output
             
-            if return_aux_loss:
-                return result, aux_loss
+            # Compute auxiliary losses for load balancing and store them
+            router_probs_a = F.softmax(router_logits_a, dim=-1).mean(dim=0)
+            router_probs_b = F.softmax(router_logits_b, dim=-1).mean(dim=0)
+            self._last_aux_loss_a = self.global_pool.num_experts_a * torch.var(router_probs_a)
+            self._last_aux_loss_b = self.global_pool.num_experts_b * torch.var(router_probs_b)
+            
+            if result.dtype != previous_dtype:
+                result = result.to(previous_dtype)
+            
+            return result
         
         if result.dtype != previous_dtype:
             result = result.to(previous_dtype)
         
-        if return_aux_loss:
-            return result, torch.tensor(0.0, device=x.device)
-        
+        # Store zero aux losses for consistency
+        self._last_aux_loss_a = torch.tensor(0.0, device=x.device)
+        self._last_aux_loss_b = torch.tensor(0.0, device=x.device)
         return result
 
 
@@ -456,19 +522,28 @@ class GD2MoRAModel(torch.nn.Module):
     def modules_to_save(self):
         return None
     
-    def get_peft_config_as_dict(self, inference: bool = False):
-        config = {k: v.value if isinstance(v, Enum) else v for k, v in asdict(self.peft_config).items()}
-        if inference:
-            config["inference_mode"] = True
-        return config
-    
     def get_aux_loss(self):
-        """Get auxiliary load balancing loss from the global pool"""
-        if hasattr(self, 'global_pool') and self.global_pool is not None:
-            # The aux loss is computed during forward pass
-            # This method can be used to retrieve stored aux loss
-            return getattr(self, '_stored_aux_loss', torch.tensor(0.0))
-        return torch.tensor(0.0)
+        """
+        Get the accumulated auxiliary load balancing loss from all layers.
+        
+        This method should be called after each forward pass to retrieve
+        the global load balancing loss that should be added to the main loss.
+        
+        Returns:
+            Total auxiliary loss across all layers and both A/B experts
+        """
+        total_aux_loss = torch.tensor(0.0, device=next(self.model.parameters()).device)
+        
+        for module in self.model.modules():
+            if isinstance(module, GD2MoRALinear) and hasattr(module, 'router'):
+                # The aux loss is computed during forward pass and returned
+                # We need to store it during forward and retrieve it here
+                if hasattr(module, '_last_aux_loss_a'):
+                    total_aux_loss = total_aux_loss + module._last_aux_loss_a
+                if hasattr(module, '_last_aux_loss_b'):
+                    total_aux_loss = total_aux_loss + module._last_aux_loss_b
+        
+        return total_aux_loss * self.peft_config.load_balancing_loss_weight
     
     def _set_adapter_layers(self, enabled=True):
         for module in self.model.modules():
