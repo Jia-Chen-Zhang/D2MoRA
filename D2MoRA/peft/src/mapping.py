@@ -29,7 +29,7 @@ from .peft_model import (
     PeftModelForSequenceClassification,
     PeftModelForTokenClassification,
 )
-from .tuners import D2MoRAConfig, PrefixTuningConfig, PromptEncoderConfig, PromptTuningConfig, BottleneckConfig
+from .tuners import D2MoRAConfig, GD2MoRAConfig, PrefixTuningConfig, PromptEncoderConfig, PromptTuningConfig, BottleneckConfig
 from .utils import PromptLearningConfig
 
 
@@ -46,6 +46,7 @@ PEFT_TYPE_TO_CONFIG_MAPPING = {
     "P_TUNING": PromptEncoderConfig,
     "BOTTLENECK": BottleneckConfig,
     "D2MORA": D2MoRAConfig,
+    "GD2MORA": GD2MoRAConfig,
 }
 
 TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING = {
@@ -182,6 +183,20 @@ def _prepare_bottleneck_config(peft_config, model_config):
     return peft_config
 
 
+def _prepare_gd2mora_config(peft_config, model_config):
+    """Prepare GD2MoRA configuration"""
+    if peft_config.target_modules is None:
+        if model_config["model_type"] not in TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING:
+            raise ValueError("Please specify `target_modules` in `peft_config`")
+        peft_config.target_modules = TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[model_config["model_type"]]
+    if len(peft_config.target_modules) == 1:
+        peft_config.fan_in_fan_out = True
+        peft_config.enable_lora = [True, False, True]
+    if peft_config.inference_mode:
+        peft_config.merge_weights = True
+    return peft_config
+
+
 def get_peft_model(model, peft_config):
     """
     Returns a Peft model object from a model and a config.
@@ -194,7 +209,10 @@ def get_peft_model(model, peft_config):
     model_config = model.config.to_dict()
     peft_config.base_model_name_or_path = model.__dict__.get("name_or_path", None)
     if peft_config.task_type not in MODEL_TYPE_TO_PEFT_MODEL_MAPPING.keys():
-        if peft_config.peft_type == "D2MORA":
+        if peft_config.peft_type == "GD2MORA":
+            peft_config = _prepare_gd2mora_config(peft_config, model_config)
+            return PeftModel(model, peft_config)
+        elif peft_config.peft_type == "D2MORA":
             peft_config = _prepare_d2mora_config(peft_config, model_config)
             return PeftModel(model, peft_config)
         elif peft_config.peft_type == "BOTTLENECK":
@@ -205,6 +223,8 @@ def get_peft_model(model, peft_config):
             peft_config = _prepare_bottleneck_config(peft_config, model_config)
         elif peft_config.peft_type == "D2MORA":
             peft_config = _prepare_d2mora_config(peft_config, model_config)
+        elif peft_config.peft_type == "GD2MORA":
+            peft_config = _prepare_gd2mora_config(peft_config, model_config)
     else:
         peft_config = _prepare_prompt_learning_config(peft_config, model_config)
     return MODEL_TYPE_TO_PEFT_MODEL_MAPPING[peft_config.task_type](model, peft_config)

@@ -30,6 +30,7 @@ class PeftType(str, enum.Enum):
     PREFIX_TUNING = "PREFIX_TUNING"
     BOTTLENECK = "BOTTLENECK"
     D2MORA = "D2MORA"
+    GD2MORA = "GD2MORA"
 
 
 class TaskType(str, enum.Enum):

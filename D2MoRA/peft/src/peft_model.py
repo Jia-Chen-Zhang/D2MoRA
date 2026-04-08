@@ -37,7 +37,7 @@ from .transformers import PreTrainedModel
 from .transformers.modeling_outputs import SequenceClassifierOutput, TokenClassifierOutput
 from .transformers.utils import PushToHubMixin
 
-from .tuners import BottleneckModel, PrefixEncoder, PromptEmbedding, PromptEncoder, D2MoRAModel
+from .tuners import BottleneckModel, PrefixEncoder, PromptEmbedding, PromptEncoder, D2MoRAModel, GD2MoRAModel
 from .utils import (
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
     WEIGHTS_NAME,
@@ -85,7 +85,9 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         if isinstance(self.peft_config, PromptLearningConfig):
             self._setup_prompt_encoder()
         else:
-            if self.peft_config.peft_type == PeftType.D2MORA:
+            if self.peft_config.peft_type == PeftType.GD2MORA:
+                self.base_model = GD2MoRAModel(peft_config, model)
+            elif self.peft_config.peft_type == PeftType.D2MORA:
                 self.base_model = D2MoRAModel(peft_config, model)
             elif self.peft_config.peft_type == PeftType.BOTTLENECK:
                 self.base_model = BottleneckModel(peft_config, model)

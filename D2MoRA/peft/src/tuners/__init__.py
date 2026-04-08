@@ -21,4 +21,5 @@ from .p_tuning import PromptEncoder, PromptEncoderConfig, PromptEncoderReparamet
 from .prefix_tuning import PrefixEncoder, PrefixTuningConfig
 from .prompt_tuning import PromptEmbedding, PromptTuningConfig, PromptTuningInit
 from .d2mora import D2MoRAConfig, D2MoRAModel
+from .gd2mora import GD2MoRAConfig, GD2MoRAModel, GlobalExpertPool
 
